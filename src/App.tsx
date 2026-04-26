@@ -63,6 +63,7 @@ export default function App() {
   const [enableFraudDetection, setEnableFraudDetection] = useState(true);
   const [status, setStatus] = useState("");
   const [cost1k, setCost1k] = useState<number | null>(null);
+  const [embeddingFeedback, setEmbeddingFeedback] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const processFiles = async (newFiles: File[]) => {
@@ -241,6 +242,17 @@ export default function App() {
         const estimated1kCost = ((avgInput * 1000) / 1000000) * flashInputCost + ((avgOutput * 1000) / 1000000) * flashOutputCost;
         // Assume roughly 1 USD = 0.95 EUR, or just treat as EUR. We'll use 0.95 factor:
         setCost1k(estimated1kCost * 0.95);
+
+        setStatus("Evaluating embedding strategy...");
+        try {
+          const feedbackResponse = await withRetry(() => ai.models.generateContent({
+             model: "gemini-flash-latest",
+             contents: `I am generating vector embeddings for receipts to detect duplicates. The string used for each receipt embedding follows this format:\nMerchant: {merchant}\nDate/Time: {date}\nTotal: {totalAmount}\nReceipt Output: {receiptText}\n\nBased on this structure, are these fields good enough to reliably detect copy-paste or duplicate receipts, or should we adjust it to be more robust? Provide a concise 1-2 sentence hint.`
+          }), "generateContent (Feedback)", 3, setStatus);
+          setEmbeddingFeedback(feedbackResponse.text || null);
+        } catch (e) {
+          console.error("Feedback error", e);
+        }
       }
 
       playChime();
@@ -372,12 +384,18 @@ export default function App() {
         </aside>
 
         <main className="flex-1 relative bg-[#EEE] p-4 flex">
-          <div className="absolute top-8 left-8 z-10 bg-white/80 backdrop-blur border border-black p-4 w-64 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]">
+          <div className="absolute top-8 left-8 z-10 bg-white/80 backdrop-blur border border-black p-4 w-96 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]">
             <h2 className="text-xs font-black uppercase mb-1 tracking-wider">Vector Space Map</h2>
             <p className="text-[10px] leading-tight text-gray-600">Projection: FastMap / Dimension: 768-d to 2-d<br/>Multimodal Embeddings Model</p>
             {processed.length === 0 && !loading && (
                <div className="mt-4 pt-4 border-t border-black text-[10px] font-bold text-orange-600 animate-pulse uppercase">
                  Drop receipt images anywhere to begin encoding
+               </div>
+            )}
+            {embeddingFeedback && (
+               <div className="mt-4 pt-4 border-t border-black text-[10px] text-gray-800 leading-tight">
+                 <span className="font-bold uppercase text-blue-600 block mb-1">Embedding Strategy Feedback:</span>
+                 {embeddingFeedback}
                </div>
             )}
           </div>
@@ -436,101 +454,6 @@ export default function App() {
           </div>
         </main>
 
-        <aside className="w-80 border-l border-black bg-white flex flex-col shrink-0 overflow-y-auto">
-          {selectedPoint ? (
-            <>
-              <div className="p-6 border-b border-black">
-                <h3 className="text-xs font-black uppercase tracking-widest mb-4 flex justify-between">
-                  <span>Inspection Panel</span>
-                  <span className={selectedPoint.analysis?.isFraudulent ? "text-orange-600" : ""}>
-                    {selectedPoint.analysis?.isFraudulent ? "[FRAUD]" : "[OK]"}
-                  </span>
-                </h3>
-                
-                <div className="bg-gray-100 border border-black p-2 mb-4 relative group">
-                  <div className="hidden group-hover:block absolute inset-0 z-10 bg-white border border-black p-1">
-                      <img src={selectedPoint.dataUrl} className="w-full h-full object-contain" alt="Original Receipt" />
-                  </div>
-                  <div className="bg-white aspect-[3/4] flex overflow-y-auto p-4 shadow-inner">
-                    <pre className="w-full text-left text-[8px] font-mono leading-[1.2] whitespace-pre-wrap">
-                      {selectedPoint.analysis?.receiptText || "TEXT EXTRACTION UNAVAILABLE"}
-                    </pre>
-                  </div>
-                  <div className="text-center text-[8px] uppercase font-bold mt-1 opacity-50">Hover to view original</div>
-                </div>
-
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-[9px] font-bold uppercase opacity-50">Metadata</label>
-                    <p className="text-sm font-bold truncate" title={selectedPoint.analysis?.merchant}>
-                      {selectedPoint.analysis?.merchant?.toUpperCase() || 'UNKNOWN MERCHANT'}
-                    </p>
-                    <p className="text-xs font-mono mt-1">€ {selectedPoint.analysis?.totalAmount} | {selectedPoint.analysis?.date || 'No Date'}</p>
-                  </div>
-                  <div>
-                    <label className="block text-[9px] font-bold uppercase opacity-50">Embedding Vector (Slice 0-7)</label>
-                    <div className="grid grid-cols-4 gap-1 mt-1 font-mono text-[10px]">
-                      {selectedPoint.embedding.slice(0, 8).map((v: number, i: number) => (
-                        <span key={i} className="bg-black text-white px-1 truncate" title={v.toString()}>
-                          {v.toFixed(3)}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </div>
-              
-              <div className="flex-1 p-6">
-                <h3 className="text-xs font-black uppercase tracking-widest mb-2">Analysis Result</h3>
-                
-                {selectedPoint.analysis?.fraudReason === "Fraud detection disabled" ? (
-                  <div className="mb-4 p-2 bg-gray-100 border border-black flex justify-between items-start opacity-70">
-                    <p className="text-[11px] leading-relaxed">Fraud detection was disabled during encode.</p>
-                  </div>
-                ) : selectedPoint.analysis?.isFraudulent ? (
-                  <div className="mb-4 p-2 bg-orange-100 border border-orange-600 text-orange-900">
-                    <div className="flex justify-between items-center mb-1">
-                      <span className="font-bold text-orange-600 block">FLAGGED FRAUDULENT</span>
-                      <span className="font-bold text-orange-800 text-xs">Score: {selectedPoint.analysis?.fraudScore}/100</span>
-                    </div>
-                    <p className="text-[11px] leading-relaxed">
-                      {selectedPoint.analysis?.fraudReason}
-                    </p>
-                  </div>
-                ) : (
-                  <div className="mb-4 p-2 bg-gray-100 border border-black flex justify-between items-start">
-                    <p className="text-[11px] leading-relaxed">Analysis passed. No immediate signs of fraud.</p>
-                    <span className="font-bold text-gray-500 text-[10px]">Score: {selectedPoint.analysis?.fraudScore || 0}/100</span>
-                  </div>
-                )}
-
-                {selectedPoint.analysis?.anomalies?.length > 0 && (
-                   <div className="mb-4">
-                     <label className="block text-[9px] font-bold uppercase opacity-50 mb-1">Detected Artifacts</label>
-                     <ul className="text-[10px] list-disc pl-4 space-y-1">
-                        {selectedPoint.analysis.anomalies.map((a: string, i: number) => (
-                          <li key={i}>{a}</li>
-                        ))}
-                     </ul>
-                   </div>
-                )}
-                
-                <div className="mt-auto flex gap-2">
-                  <button className={`flex-1 text-white text-[10px] font-black uppercase py-2 ${selectedPoint.analysis?.isFraudulent ? 'bg-red-600 hover:bg-black' : 'bg-black hover:bg-red-600'}`}>
-                    Flag Fraud
-                  </button>
-                  <button className="flex-1 border border-black text-[10px] font-black uppercase py-2 hover:bg-gray-100">
-                    Dismiss
-                  </button>
-                </div>
-              </div>
-            </>
-          ) : (
-             <div className="flex-1 flex items-center justify-center p-6 text-center text-gray-500 text-xs italic">
-                Select an encoded point in the vector space to inspect details.
-             </div>
-          )}
-        </aside>
       </div>
 
       <footer className="h-12 border-t border-black bg-black text-white flex items-center px-8 justify-between text-[10px] font-bold uppercase tracking-widest shrink-0">
@@ -540,6 +463,9 @@ export default function App() {
              Session: ACTIVE
              {cost1k !== null && (
                <span className="ml-4 opacity-70">| EST. API COST (1000 RECEIPTS): €{cost1k.toFixed(4)}</span>
+             )}
+             {processed.length > 0 && processed[0].embedding && (
+               <span className="ml-4 opacity-70 text-blue-300">| AVG. VECTOR DIMENSION: {Math.round(processed.reduce((sum, p) => sum + (p.embedding?.length || 0), 0) / processed.length)}</span>
              )}
           </span>
         </div>
