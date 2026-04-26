@@ -3,9 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useRef, useMemo, Fragment } from "react";
+import React, { useState, useRef, useMemo, Fragment } from "react";
 import { GoogleGenAI, Type } from "@google/genai";
 import { fastMap2D, cosineSimilarity } from "./lib/math";
+import jsPDF from 'jspdf';
+import html2canvas from 'html2canvas';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -33,18 +35,24 @@ const playChime = () => {
     } catch(e) {}
 };
 
-async function withRetry<T>(fn: () => Promise<T>, apiName: string, maxRetries = 3, setStatus?: (msg: string) => void): Promise<T> {
+async function withRetry<T>(fn: () => Promise<T>, apiName: string, maxRetries = 5, setStatus?: (msg: string) => void): Promise<T> {
   let retries = 0;
   while (true) {
     try {
       return await fn();
     } catch (e: any) {
       const errorString = typeof e === 'object' ? JSON.stringify(e) + String(e.message) : String(e);
-      if ((errorString.includes("429") || errorString.includes("RESOURCE_EXHAUSTED") || errorString.includes("quota")) && retries < maxRetries) {
+      const isRateLimit = errorString.includes("429") || errorString.includes("RESOURCE_EXHAUSTED") || errorString.includes("quota");
+      
+      if (isRateLimit && retries < maxRetries) {
         retries++;
-        // Wait longer for each retry (5, 10, 20s) to give the free tier quota time to reset. RPM limit is usually 15.
-        const delayMs = 5000 * Math.pow(2, retries - 1);
-        const msg = `Rate limit hit on ${apiName}, retrying in ${delayMs/1000}s... (${retries}/${maxRetries})`;
+        // Use exponential backoff with jitter. Base delay increases: 8s, 16s, 32s, 64s, 128s
+        // Jitter helps avoid "thundering herd" if multiple calls retry at the same time.
+        const baseDelay = 8000 * Math.pow(2, retries - 1);
+        const jitter = Math.random() * 2000;
+        const delayMs = baseDelay + jitter;
+        
+        const msg = `Rate limit hit on ${apiName}, retrying in ${Math.round(delayMs/100)/10}s... (${retries}/${maxRetries})`;
         console.warn(msg);
         if (setStatus) setStatus(msg);
         await new Promise(resolve => setTimeout(resolve, delayMs));
@@ -65,6 +73,8 @@ export default function App() {
   const [cost1k, setCost1k] = useState<number | null>(null);
   const [embeddingFeedback, setEmbeddingFeedback] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const [isExporting, setIsExporting] = useState(false);
 
   const processFiles = async (newFiles: File[]) => {
     setLoading(true);
@@ -91,6 +101,8 @@ export default function App() {
             merchant: "Unknown",
             date: "Unknown",
             totalAmount: 0.0,
+            transactionId: "Unknown",
+            lineItems: "None",
             anomalies: [],
             fraudScore: 0,
             isFraudulent: false,
@@ -100,11 +112,11 @@ export default function App() {
 
           const currentDate = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
           const extractionPrompt = enableFraudDetection 
-            ? `You are an expert fraud investigator analyzing Dutch receipts. Today's exact date is: ${currentDate}. Any receipt date before today is in the past and is NOT a future date. Carefully examine the image for signs of financial fraud, tampering, or copy-paste forgery (e.g., duplicated receipts with altered values). Check for: 1) Math errors, 2) Font/typography inconsistencies, 3) Suspicious items/amounts. DO NOT flag based on future dates or timestamps, completely ignore dates/times when evaluating fraud. Output JSON extracting: merchant name, totalAmount, date, a list of specific 'anomalies', a 'fraudScore' (0-100), a boolean 'isFraudulent' (true if score > 50), and a 'fraudReason' (Start with a VERY brief 1-sentence concise explanation, then provide full details below it). Also extract a raw ascii text representation of the receipt contents ('receiptText'). ALWAYS output valid JSON matching the exact schema provided.`
-            : "Extract data from this receipt. Focus only on factual extraction. Output JSON extracting: merchant name, totalAmount, date, and a raw ascii text representation of the receipt contents ('receiptText'). Fill in the other required schema fields with default empty values: anomalies: [], fraudScore: 0, isFraudulent: false, fraudReason: 'Disabled'. ALWAYS output valid JSON matching the exact schema provided.";
+            ? `You are an expert fraud investigator analyzing Dutch receipts. Today's exact date is: ${currentDate}. Any receipt date before today is in the past and is NOT a future date. Carefully examine the image for signs of financial fraud, tampering, or copy-paste forgery (e.g., duplicated receipts with altered values). Check for: 1) Math errors, 2) Font/typography inconsistencies, 3) Suspicious items/amounts. DO NOT flag based on future dates or timestamps, completely ignore dates/times when evaluating fraud. Output JSON extracting: merchant name, totalAmount, date, transactionId, lineItems, a list of specific 'anomalies', a 'fraudScore' (0-100), a boolean 'isFraudulent' (true if score > 50), and a 'fraudReason' (Start with a VERY brief 1-sentence concise explanation, then provide full details below it). Also extract a raw ascii text representation of the receipt contents ('receiptText'). ALWAYS output valid JSON matching the exact schema provided.`
+            : "Extract data from this receipt. Focus only on factual extraction. Output JSON extracting: merchant name, totalAmount, date, transactionId, lineItems, and a raw ascii text representation of the receipt contents ('receiptText'). Fill in the other required schema fields with default empty values: anomalies: [], fraudScore: 0, isFraudulent: false, fraudReason: 'Disabled'. ALWAYS output valid JSON matching the exact schema provided.";
 
           const analysisResponse = await withRetry(() => ai.models.generateContent({
-            model: "gemini-flash-latest",
+            model: "gemini-3.1-flash-lite-preview",
             contents: {
               parts: [
                 { text: extractionPrompt },
@@ -118,8 +130,10 @@ export default function App() {
                 type: Type.OBJECT,
                 properties: {
                   merchant: { type: Type.STRING },
-                  date: { type: Type.STRING },
-                  totalAmount: { type: Type.NUMBER },
+                  date: { type: Type.STRING, description: "Normalized to ISO 8601 format (e.g., YYYY-MM-DDTHH:mm:ssZ)" },
+                  totalAmount: { type: Type.NUMBER, description: "Normalized to two decimal places" },
+                  transactionId: { type: Type.STRING, description: "A unique Transaction or Invoice ID from the receipt" },
+                  lineItems: { type: Type.STRING, description: "A comma-separated list of item names or line-item counts to help distinguish between different visits" },
                   anomalies: { type: Type.ARRAY, items: { type: Type.STRING } },
                   fraudScore: { type: Type.NUMBER, description: "Score from 0 to 100 indicating likelihood of fraud" },
                   isFraudulent: { type: Type.BOOLEAN },
@@ -145,8 +159,10 @@ export default function App() {
           // 2. Fact-Based Vector Embedding for Duplicate Detection
           const duplicateSignature = [
             `Merchant: ${analysisObj.merchant}`,
+            `Transaction ID: ${analysisObj.transactionId}`,
             `Date/Time: ${analysisObj.date}`,
-            `Total: ${analysisObj.totalAmount}`,
+            `Total: ${analysisObj.totalAmount?.toFixed?.(2) || analysisObj.totalAmount}`,
+            `Line Items: ${analysisObj.lineItems}`,
             `Receipt Output: ${analysisObj.receiptText}`
           ].join("\n");
 
@@ -166,7 +182,8 @@ export default function App() {
           // Pacing to avoid rate limit (RESOURCE_EXHAUSTED 429)
           if (i < newFiles.length - 1) {
             setStatus("Pacing API requests to avoid rate limits...");
-            await new Promise(resolve => setTimeout(resolve, 4000));
+            // Increase delay to 8s between files to stay well within 15 RPM limits for free tier
+            await new Promise(resolve => setTimeout(resolve, 8000));
           }
 
         } catch (e: any) {
@@ -246,9 +263,9 @@ export default function App() {
         setStatus("Evaluating embedding strategy...");
         try {
           const feedbackResponse = await withRetry(() => ai.models.generateContent({
-             model: "gemini-flash-latest",
-             contents: `I am generating vector embeddings for receipts to detect duplicates. The string used for each receipt embedding follows this format:\nMerchant: {merchant}\nDate/Time: {date}\nTotal: {totalAmount}\nReceipt Output: {receiptText}\n\nBased on this structure, are these fields good enough to reliably detect copy-paste or duplicate receipts, or should we adjust it to be more robust? Provide a concise 1-2 sentence hint.`
-          }), "generateContent (Feedback)", 3, setStatus);
+             model: "gemini-3.1-flash-lite-preview",
+             contents: `I am generating vector embeddings for receipts to detect duplicates. It's perfectly fine if the system mixes up near-duplicates and exact duplicates, as our main goal is simply to surface any potential duplicate pairs. The string used for each receipt embedding follows this format:\nMerchant: {merchant}\nTransaction ID: {transactionId}\nDate/Time: {date}\nTotal: {totalAmount}\nLine Items: {lineItems}\nReceipt Output: {receiptText}\n\nBased on this structure, are these fields good enough to reliably detect copy-paste or duplicate receipts, or should we adjust it to be more robust? Provide a concise 1-2 sentence hint.`
+          }), "generateContent (Feedback)", 1, setStatus);
           setEmbeddingFeedback(feedbackResponse.text || null);
         } catch (e) {
           console.error("Feedback error", e);
@@ -271,6 +288,132 @@ export default function App() {
     if (droppedFiles.length) processFiles(droppedFiles as File[]);
   };
 
+  const exportPDF = async () => {
+    if (processed.length === 0) return;
+    setIsExporting(true);
+    setStatus("Generating PDF Report...");
+    
+    try {
+      const doc = new jsPDF('p', 'mm', 'a4');
+      let currentY = 20;
+      
+      const checkPageBreak = (neededHeight: number) => {
+        if (currentY + neededHeight > 280) {
+           doc.addPage();
+           currentY = 20;
+        }
+      };
+
+      const addText = (text: string, size: number = 10, isBold: boolean = false, x: number = 20) => {
+        doc.setFontSize(size);
+        doc.setFont("helvetica", isBold ? "bold" : "normal");
+        const lines = doc.splitTextToSize(text, 210 - x - 20); // 210mm wide A4, minus margins
+        for (const line of lines) {
+           checkPageBreak(size * 0.4 + 2);
+           doc.text(line, x, currentY);
+           currentY += size * 0.4 + 2; 
+        }
+      };
+      
+      addText("KWITTI RECEIPT ANALYSIS REPORT", 20, true);
+      currentY += 10;
+      addText(`Generated on: ${new Date().toLocaleString()}`);
+      addText(`Total Receipts Processed: ${processed.length}`);
+      addText(`Total Exact Duplicates: ${duplicateEdges.filter(e => e.type === 'exact').length}`);
+      addText(`Total Near Duplicates: ${duplicateEdges.filter(e => e.type === 'near').length}`);
+      addText(`Total Frauds Detected: ${anomalousCount}`);
+      
+      if (cost1k !== null) {
+        addText(`Est API Cost / 1k Receipts: €${cost1k.toFixed(4)}`);
+      }
+      
+      currentY += 10;
+      
+      // Capture the vector space map
+      if (mapContainerRef.current) {
+         addText("VECTOR SPACE MAP", 16, true);
+         currentY += 5;
+         
+         const canvas = await html2canvas(mapContainerRef.current, { scale: 2 });
+         const imgData = canvas.toDataURL('image/png');
+         const imgWidth = 170;
+         const imgHeight = (canvas.height * imgWidth) / canvas.width;
+         
+         checkPageBreak(imgHeight + 10);
+         
+         doc.addImage(imgData, 'PNG', 20, currentY, imgWidth, imgHeight);
+         currentY += imgHeight + 15;
+      }
+      
+      const printReceiptDetails = (point: any, titlePrefix: string) => {
+          checkPageBreak(30);
+          addText(`${titlePrefix}: ${point.file?.name}`, 12, true);
+          addText(`Status: ${point.analysis?.isFraudulent ? 'FRAUD' : 'OK'} (Score: ${point.analysis?.fraudScore})`);
+          addText(`Merchant: ${point.analysis?.merchant}`);
+          addText(`Date: ${point.analysis?.date}`);
+          addText(`Total: €${point.analysis?.totalAmount}`);
+          if (point.analysis?.transactionId) addText(`Transaction ID: ${point.analysis?.transactionId}`);
+          if (point.analysis?.lineItems) addText(`Line Items: ${point.analysis?.lineItems}`);
+          if (point.analysis?.anomalies?.length > 0) addText(`Anomalies: ${point.analysis?.anomalies.join(', ')}`);
+          if (point.analysis?.fraudReason) addText(`Reason: ${point.analysis?.fraudReason}`);
+          currentY += 5;
+          
+          if (point.dataUrl) {
+              try {
+                const imgProps = doc.getImageProperties(point.dataUrl);
+                const ratio = imgProps.width / imgProps.height;
+                const targetHeight = 80;
+                const targetWidth = targetHeight * ratio;
+                checkPageBreak(targetHeight + 10);
+                doc.addImage(point.dataUrl, point.dataUrl.includes('jpeg') || point.dataUrl.includes('jpg') ? 'JPEG' : 'PNG', 20, currentY, targetWidth, targetHeight);
+                currentY += targetHeight + 10;
+              } catch (imageErr) {
+                addText(`[Image could not be rendered]`);
+                currentY += 10;
+              }
+          }
+      };
+
+      // Receipts list
+      doc.addPage();
+      currentY = 20;
+      addText("DETECTED DUPLICATES", 16, true);
+      currentY += 5;
+      
+      for (const edge of duplicateEdges) {
+         checkPageBreak(30);
+         addText(`--- DUPLICATE PAIR ---`, 14, true);
+         addText(`Similarity: ${edge.sim.toFixed(4)} (${edge.type.toUpperCase()})`, 12, true);
+         currentY += 5;
+         
+         printReceiptDetails(edge.p1, 'File 1');
+         currentY += 5;
+         printReceiptDetails(edge.p2, 'File 2');
+         currentY += 10;
+      }
+      
+      if (singleReceipts.length > 0) {
+        doc.addPage();
+        currentY = 20;
+        addText("UNIQUE RECEIPTS", 16, true);
+        currentY += 5;
+        
+        for (const point of singleReceipts) {
+           printReceiptDetails(point, 'File');
+           currentY += 10;
+        }
+      }
+
+      doc.save('kwitti-analysis-report.pdf');
+      setStatus("PDF Report exported.");
+    } catch (e: any) {
+      console.error(e);
+      setStatus("Error generating PDF Report: " + e.message);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
       const selectedFiles = Array.from(e.target.files).filter((f: any) => f.type.startsWith('image/'));
@@ -281,21 +424,30 @@ export default function App() {
   const anomalousCount = processed.filter(p => p.analysis?.isFraudulent).length;
 
   const duplicateEdges = useMemo(() => {
-    const pairs: { type: 'exact' | 'near', p1: any, p2: any }[] = [];
+    const pairs: { type: 'exact' | 'near', p1: any, p2: any, sim: number }[] = [];
     for (let i = 0; i < processed.length; i++) {
         for (let j = i + 1; j < processed.length; j++) {
             // We use cosine similarity here.
             // > 0.98 indicates exact clones, > 0.90 for almost identical / near duplicates
             const sim = cosineSimilarity(processed[i].embedding, processed[j].embedding);
             if (sim > 0.98) { 
-                pairs.push({ type: 'exact', p1: processed[i], p2: processed[j] });
+                pairs.push({ type: 'exact', p1: processed[i], p2: processed[j], sim });
             } else if (sim > 0.90) {
-                pairs.push({ type: 'near', p1: processed[i], p2: processed[j] });
+                pairs.push({ type: 'near', p1: processed[i], p2: processed[j], sim });
             }
         }
     }
     return pairs;
   }, [processed]);
+
+  const singleReceipts = useMemo(() => {
+    const receiptsInPairs = new Set<string>();
+    duplicateEdges.forEach(edge => {
+      receiptsInPairs.add(edge.p1.id);
+      receiptsInPairs.add(edge.p2.id);
+    });
+    return processed.filter(p => !receiptsInPairs.has(p.id));
+  }, [processed, duplicateEdges]);
 
   const getConnectedReceipts = (point: any) => {
     if (!point) return [];
@@ -369,6 +521,13 @@ export default function App() {
             onChange={handleFileInput}
           />
           <button 
+            disabled={loading || processed.length === 0 || isExporting}
+            onClick={exportPDF}
+            className="border-2 border-black px-4 py-2 hover:bg-black hover:text-white transition-colors disabled:opacity-50"
+          >
+            {isExporting ? 'Exporting PDF...' : 'Export PDF'}
+          </button>
+          <button 
             disabled={loading}
             onClick={() => fileInputRef.current?.click()}
             className="border-2 border-black px-4 py-2 hover:bg-black hover:text-white transition-colors disabled:opacity-50 ml-2"
@@ -400,22 +559,30 @@ export default function App() {
             )}
           </div>
 
-          <div className="flex-1 h-full border-2 border-black bg-white relative">
+          <div ref={mapContainerRef} className="flex-1 h-full border-2 border-black bg-white relative">
             {processed.length > 0 && (
-              <svg className="w-full h-full absolute inset-0">
+              <svg className="w-full h-full absolute inset-0 overflow-visible text-[10px] font-bold">
                 {/* Draw Duplicate Relationships First (bottom-most layer) */}
-                {duplicateEdges.map((edge, i) => (
-                  <line 
-                    key={`duplicate-${i}`}
-                    x1={`${edge.p1.x * 100}%`}
-                    y1={`${edge.p1.y * 100}%`}
-                    x2={`${edge.p2.x * 100}%`}
-                    y2={`${edge.p2.y * 100}%`}
-                    stroke={edge.type === 'exact' ? "red" : "darkorange"}
-                    strokeWidth={edge.type === 'exact' ? "3" : "2"}
-                    strokeDasharray={edge.type === 'exact' ? "4 2" : "2 4"}
-                  />
-                ))}
+                {duplicateEdges.map((edge, i) => {
+                  const x1 = edge.p1.x * 100;
+                  const y1 = edge.p1.y * 100;
+                  const x2 = edge.p2.x * 100;
+                  const y2 = edge.p2.y * 100;
+                  
+                  return (
+                    <g key={`duplicate-${i}`}>
+                      <line 
+                        x1={`${x1}%`}
+                        y1={`${y1}%`}
+                        x2={`${x2}%`}
+                        y2={`${y2}%`}
+                        stroke={edge.type === 'exact' ? "red" : "darkorange"}
+                        strokeWidth={edge.type === 'exact' ? "3" : "2"}
+                        strokeDasharray={edge.type === 'exact' ? "4 2" : "2 4"}
+                      />
+                    </g>
+                  );
+                })}
               </svg>
             )}
 
@@ -454,6 +621,82 @@ export default function App() {
           </div>
         </main>
 
+        <aside className="w-96 border-l border-black bg-white flex flex-col shrink-0 overflow-y-auto">
+          <div className="p-4 border-b border-black bg-gray-100 flex items-center justify-between sticky top-0 z-10">
+            <h3 className="text-xs font-black uppercase tracking-widest">Analysis Results</h3>
+            <span className="text-[10px] font-mono font-bold bg-black text-white px-2 py-1">{processed.length} TOTAL</span>
+          </div>
+
+          <div className="p-4 space-y-6">
+            {/* DUPLICATES SECTION */}
+            {duplicateEdges.length > 0 && (
+              <div>
+                 <h4 className="text-[10px] font-black uppercase text-orange-600 mb-3 border-b border-black pb-1">Detected Duplicates</h4>
+                 <div className="space-y-3">
+                   {duplicateEdges.map((edge, i) => (
+                      <div key={i} className="border border-black p-3 bg-white text-xs">
+                         <div className="flex justify-between items-center mb-2 pb-2 border-b border-dashed border-gray-300">
+                           <span className="font-bold text-[10px] uppercase">Similarity</span>
+                           <span className={`font-mono font-bold text-[10px] px-1 text-white ${edge.type === 'exact' ? 'bg-red-600' : 'bg-orange-600'}`}>{edge.sim.toFixed(4)}</span>
+                         </div>
+                         <div className="flex gap-4">
+                            <div 
+                               className="flex-1 flex flex-col overflow-hidden cursor-pointer hover:bg-gray-50 p-1"
+                               onClick={() => { setSelectedPoint(edge.p1); setShowImageOverlay(true); }}
+                            >
+                               <span className="font-bold truncate text-[10px]" title={edge.p1.file?.name}>{edge.p1.file?.name}</span>
+                               <span className={`text-[9px] font-bold mt-1 ${edge.p1.analysis?.isFraudulent ? 'text-red-600' : 'text-gray-500'}`}>
+                                 {edge.p1.analysis?.isFraudulent ? 'FRAUD' : 'OK'} (Score: {edge.p1.analysis?.fraudScore})
+                               </span>
+                            </div>
+                            <div className="w-px bg-gray-300 shrink-0"></div>
+                            <div 
+                               className="flex-1 flex flex-col overflow-hidden cursor-pointer hover:bg-gray-50 p-1"
+                               onClick={() => { setSelectedPoint(edge.p2); setShowImageOverlay(true); }}
+                            >
+                               <span className="font-bold truncate text-[10px]" title={edge.p2.file?.name}>{edge.p2.file?.name}</span>
+                               <span className={`text-[9px] font-bold mt-1 ${edge.p2.analysis?.isFraudulent ? 'text-red-600' : 'text-gray-500'}`}>
+                                 {edge.p2.analysis?.isFraudulent ? 'FRAUD' : 'OK'} (Score: {edge.p2.analysis?.fraudScore})
+                               </span>
+                            </div>
+                         </div>
+                      </div>
+                   ))}
+                 </div>
+              </div>
+            )}
+
+            {/* SINGLETONS SECTION */}
+            {singleReceipts.length > 0 && (
+              <div>
+                 <h4 className="text-[10px] font-black uppercase text-gray-600 mb-3 border-b border-black pb-1">Unique Receipts</h4>
+                 <div className="space-y-2">
+                   {singleReceipts.map(point => (
+                     <div 
+                       key={point.id} 
+                       className="border border-gray-300 p-2 flex justify-between items-center text-xs hover:border-black hover:bg-gray-50 cursor-pointer transition-colors"
+                       onClick={() => { setSelectedPoint(point); setShowImageOverlay(true); }}
+                     >
+                       <div className="flex flex-col overflow-hidden mr-2">
+                         <span className="font-bold truncate text-[10px]" title={point.file?.name}>{point.file?.name}</span>
+                         <span className={`text-[9px] font-bold mt-1 ${point.analysis?.isFraudulent ? 'text-red-600' : 'text-gray-500'}`}>
+                           {point.analysis?.isFraudulent ? 'FRAUD' : 'OK'} (Score: {point.analysis?.fraudScore})
+                         </span>
+                       </div>
+                     </div>
+                   ))}
+                 </div>
+              </div>
+            )}
+            
+            {processed.length === 0 && (
+               <div className="text-center text-gray-400 text-xs italic mt-8">
+                 No receipts analyzed yet.
+               </div>
+            )}
+          </div>
+        </aside>
+
       </div>
 
       <footer className="h-12 border-t border-black bg-black text-white flex items-center px-8 justify-between text-[10px] font-bold uppercase tracking-widest shrink-0">
@@ -475,11 +718,15 @@ export default function App() {
       </footer>
 
       {showImageOverlay && selectedPoint && (
-        <div className="fixed inset-0 bg-black/90 z-50 flex flex-col p-8">
-            <div className="flex justify-between items-center mb-6 shrink-0">
+        <div 
+          className="fixed inset-0 bg-black/90 z-50 flex flex-col p-8"
+          onClick={(e) => { if (e.target === e.currentTarget) setShowImageOverlay(false); }}
+        >
+            <div className="flex justify-between items-center mb-6 shrink-0 pointer-events-none">
                <h2 className="text-white text-2xl font-black uppercase tracking-wider">Receipt Verification</h2>
-               <button onClick={() => setShowImageOverlay(false)} className="text-white text-4xl hover:text-red-500 transition-colors">&times;</button>
+               <button onClick={() => setShowImageOverlay(false)} className="text-white text-4xl hover:text-red-500 transition-colors pointer-events-auto">&times;</button>
             </div>
+
             <div className="flex-1 flex gap-6 overflow-hidden justify-center overflow-x-auto w-full">
                 {(() => {
                   const receipts = getConnectedReceipts(selectedPoint);
